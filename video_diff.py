@@ -5,6 +5,7 @@ import cv2
 import uuid
 import Utils
 from PIL import Image
+from tqdm import tqdm
 from numpy import average, dot, linalg
 
 
@@ -34,11 +35,13 @@ class VideoHandler(object):
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             return
-        self.video_info = self.get_video_info()
         self.cap = cap
+        self.video_info = self.get_video_info()
 
     # 视频信息
     def get_video_info(self) -> dict:
+        if self.video_info is not None and len(self.video_info) > 0:
+            return self.video_info
         cap = self.cap
         if cap is None:
             return {}
@@ -69,32 +72,24 @@ class VideoHandler(object):
         cap = self.cap
         if cap is None:
             return []
-        if self.video_info == {}:
-            self.video_info = self.get_video_info()
-        video_info = self.video_info
-        c = 1 # 帧计数
+        video_info = self.get_video_info()
         timeF=15 # 视频帧计数间隔频率
         if 0 < ratio < 1:
             timeF = int(video_info["frame_count"] * ratio) # 按全局帧数比例抽帧
+        frame_ids = [i for i in range(0, video_info["frame_count"], timeF)] # 设置要抽取的帧id
         images = [] # 保存的图片地址
-        if cap.isOpened():  # 判断是否正常打开
-            rval, frame = cap.read()
-        else:
-            rval = False
-        # TODO: 优化抽帧逻辑, 减少耗时
         print('开始抽帧:', self.video_path)
-        while rval:  # 循环读取视频帧
+        for fid in tqdm(frame_ids, desc='抽帧进度'):
             rval, frame = cap.read()
-            if (c % timeF == 0):  # 每隔timeF帧进行存储操作
-                if frame is not None:
-                    video_name = self.video_name+'_'+str(uuid.uuid1())
-                    img_full_name = save_path + video_name + '_' + str(c) + '.jpg'
-                    cv2.imwrite(img_full_name, frame) # 存储为图像
-                    images.append(img_full_name)
-            c = c + 1
-            Utils.flush_progress(video_info["frame_count"], c, msg='抽帧进度') # 进度条
+            if not rval:
+                break
+            video_name = self.video_name+'_'+str(uuid.uuid1())
+            img_full_name = save_path + video_name + '_' + str(fid) + '.jpg'
+            cv2.imwrite(img_full_name, frame) # 存储为图像
+            images.append(img_full_name)
             cv2.waitKey(1)
-        print()
+            # 跳帧
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
         print('抽帧完成:', self.video_path)
         self.tmp_files.extend(images)
         return images
@@ -127,6 +122,9 @@ class VideoHandler(object):
     def is_same(v1_path, v2_path, threshold=0.9, frame_ratio=0.15):
         v1 = VideoHandler(v1_path)
         v2 = VideoHandler(v2_path)
+        if v1.cap is None or v2.cap is None:
+            print('视频加载失败')
+            return False
         v1_info = v1.video_info
         v2_info = v2.video_info
         print('视频基本信息:')
@@ -151,6 +149,20 @@ def test_video_info():
     video_path = 'data/video/fjdc.mp4'
     info = VideoHandler.get_video_info(video_path)
     print(info)
+
+
+# 视频跳帧测试
+def test_video_skip_frame():
+    v = VideoHandler('data/video/fjdc.mp4')
+    info = v.get_video_info()
+    frame_ids = [i for i in range(1, info["frame_count"], 15)]
+    for fid in frame_ids:
+        rval, frame = v.cap.read()
+        if not rval:
+            break
+        cv2.imshow('frame', frame)
+        cv2.waitKey(1)
+        v.cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
 
 
 # ========================
@@ -206,7 +218,7 @@ def test_image_diff():
 def main():
     v1 = 'data/video/fjdc.mp4'
     v2 = 'data/video/fjdc2.mp4'
-    res = VideoHandler.is_same(v1, v2)
+    res = VideoHandler.is_same(v1, v2, frame_ratio=0.05)
     if res:
         print('视频相似')
     else:
