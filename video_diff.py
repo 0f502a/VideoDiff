@@ -4,7 +4,7 @@ import os
 import cv2
 import time
 import uuid
-import Utils
+import utils.Utils as Utils
 from PIL import Image
 from tqdm import tqdm
 from numpy import average, dot, linalg
@@ -14,10 +14,11 @@ from numpy import average, dot, linalg
 # 多视频处理类
 # ========================
 class MultiVideoHandler(object):
-    def __init__(self, folder) -> None:
+    def __init__(self, folder, frame_ratio=0.15) -> None:
         self.folder = folder    # 视频文件夹
         self.videos = []        # 视频列表
         self.sim_set = None     # 相似视频的组合
+        self.frame_ratio = frame_ratio
         self.load()
 
     def __del__(self):
@@ -31,11 +32,15 @@ class MultiVideoHandler(object):
             return
         files = os.listdir(self.folder)
         video_paths = [os.path.join(self.folder, f) for f in files if f.endswith('.mp4')]
+        print(">>> 视频数量: {} <<<".format(len(video_paths)))
         for p in tqdm(video_paths, desc='视频加载'):
-            v = VideoHandler(p)
-            self.videos.append(v)
+            v = VideoHandler(p, frame_ratio=self.frame_ratio)
+            if v and v.cap:
+                self.videos.append(v)
+        print(">>> 成功加载视频数：{} <<<".format(len(self.videos)))
         # 计算视频间的相似性
         self.sim_set, cnt = self.compare()
+        print('>>> 共有{}组相似视频, 共{}个相似视频 <<<'.format(len(self.sim_set), cnt)) 
 
     # 比较文件夹下所有视频之间的相似性，返回相似视频的组合、相似视频的数量
     def compare(self, threshold=0.99):
@@ -50,13 +55,14 @@ class MultiVideoHandler(object):
                     sim_videos[i].append(j)
                     sim_videos[j].append(i)
         st = set()
-        cnt = 0
         for i in range(len(sim_videos)):
             if len(sim_videos[i]) > 0:
                 vs = [i] + sim_videos[i]
                 vs.sort()
                 st.add(tuple(vs))
-                cnt += len(vs)
+        cnt = 0
+        for tup in st:
+            cnt += len(tup)
         return st, cnt # 返回相似视频的组合、相似视频的数量
     
     # 删除重复视频
@@ -71,21 +77,10 @@ class MultiVideoHandler(object):
             v_lst.sort(key=lambda x: (x.video_info['width'], x.video_info['modify_time']), reverse=True)
             for v in v_lst[1:]:
                 print('删除视频', v.video_path)
+                v.release(v.cap) # 释放视频资源
                 os.remove(v.video_path)
             del_cnt += len(v_lst) - 1
-        print('删除视频数量', del_cnt)
-
-@Utils.timing
-def test_multi_video_compare():
-    folder = 'data/xiaoe/'
-    mv = MultiVideoHandler(folder)
-    print(mv.sim_set)
-
-@Utils.timing
-def test_delete_duplicate():
-    folder = 'data/xiaoe2/'
-    mv = MultiVideoHandler(folder)
-    mv.delete_duplicate()
+        print('>>> 删除视频数量 {} <<<'.format(del_cnt))
 
 
 # ========================
@@ -93,38 +88,59 @@ def test_delete_duplicate():
 # ========================
 class VideoHandler(object):
     def __init__(self, video_path, frame_ratio=0.15):
+        # 初始化参数
         self.video_path = video_path
-        self.video_name = video_path.split('/')[-1].split('.')[0]
-        self.video_info = dict()
-        self.cap = None
-        self.frames = []
         self.frame_ratio = frame_ratio
-        self.load()
+        self.video_name = video_path.split('/')[-1].split('.')[0]
+        self.__video_info = dict()
+        self.__frames = list()
+        # 载入视频信息、预处理
+        self.cap = self.load(video_path)
+        if self.cap is None:
+            return None
+        self.__video_info = self.extract_video_info(cap=self.cap, video_path=video_path)
+        self.__frames = self.save_img(cap=self.cap, video_path=video_path, ratio=frame_ratio)
     
     # 析构函数：退出时释放资源、清除临时文件
     def __del__(self):
-        if self.cap is not None:
-            self.cap.release()
+        self.release(self.cap)
+        self.__clear_tmp(self.__frames)
+            
+    # 加载视频
+    @staticmethod
+    def load(video_path=""):
+        if not os.path.exists(video_path):
+            print("[load] video_path not exists")
+            return None
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print("[load] cap.isOpened()=False")
+                return None
+            return cap
+        except Exception as e:
+            print(e)
+            return None
+
+    # 释放视频资源
+    @staticmethod
+    def release(cap=None):
+        if cap and cap.isOpened():
+            cap.release()
             cv2.destroyAllWindows()
             # print('释放视频资源: ', self.video_path)
-        if len(self.frames) > 0:
-            self.__clear_tmp(self.frames)
-            # print('清除临时文件: ', self.frames)
-
-    def load(self):
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            return
-        self.cap = cap
-        self.video_info = self.get_video_info()
-        self.frames = self.save_img(ratio=self.frame_ratio)
-        
+    
     # 视频信息
     def get_video_info(self) -> dict:
-        if self.video_info is not None and len(self.video_info) > 0:
-            return self.video_info
-        cap = self.cap
-        if cap is None:
+        return self.__video_info
+
+    # 提取视频信息
+    def extract_video_info(self, cap, video_path) -> dict:
+        if cap is None or not cap.isOpened():
+            print("[extract_video_info] read cap error")
+            return {}
+        if not os.path.exists(video_path):
+            print(["[extract_video_info] read video_path error"])
             return {}
         # 帧率
         fps = int(round(cap.get(cv2.CAP_PROP_FPS)))
@@ -137,12 +153,11 @@ class VideoHandler(object):
         # 时长，单位s
         duration = frame_count / fps
         # md5
-        md5 = Utils.get_md5(self.video_path)
+        md5 = Utils.get_md5(video_path)
         # 获取创建时间
-        file_info = os.stat(self.video_path)
+        file_info = os.stat(video_path)
         create_time = time.localtime(file_info.st_ctime)
         create_time_str = time.strftime("%Y-%m-%d %H:%M:%S", create_time)
-
         # 获取修改时间
         modify_time = time.localtime(file_info.st_mtime)
         modify_time_str = time.strftime("%Y-%m-%d %H:%M:%S", modify_time)
@@ -158,30 +173,44 @@ class VideoHandler(object):
             'modify_time': modify_time_str
         }
 
+    # 获取视频帧的列表
+    def get_frames(self) -> list:
+        return self.__frames
+
     # 视频抽帧
-    def save_img(self, save_path='tmp/', ratio=0.15) -> list:
-        cap = self.cap
-        if cap is None:
+    def save_img(self, cap, video_path, save_path='tmp/', ratio=0.15) -> list:
+        # 读取视频
+        if cap is None or video_path == "":
+            print("[save_img] cap or video_path is None")
             return []
+        # 保存图片目录
         if not os.path.exists(save_path):
             os.makedirs(save_path)
-        video_info = self.get_video_info()
-        timeF=15 # 视频帧计数间隔频率
+        # 设置视频帧计数间隔频率
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_step=15 
         if 0 < ratio < 1:
-            timeF = int(video_info["frame_count"] * ratio) # 按全局帧数比例抽帧
-        frame_ids = [i for i in range(0, video_info["frame_count"], timeF)] # 设置要抽取的帧id
-        images = [] # 保存的图片地址
+            frame_step = round(1 / ratio)
+        frame_ids = [i for i in range(0, frame_count, frame_step)] # 设置要抽取的帧id
+        # 图片列表
+        images = []
+        video_name = video_path.split('/')[-1].split('.')[0]
         for fid in frame_ids:
             rval, frame = cap.read()
             if not rval:
                 break
-            video_name = self.video_name+'_'+str(uuid.uuid1())
-            img_full_name = save_path + video_name + '_' + str(fid) + '.jpg'
+            # 图片名称: {文件夹}{视频名}_{随机uuid}_{帧id}.jpg
+            img_full_name = "{}{}_{}_{}.{}".format(
+                save_path,
+                video_name,
+                str(uuid.uuid1()),
+                fid,
+                'jpg'
+            )
             cv2.imwrite(img_full_name, frame) # 存储为图像
             images.append(img_full_name)
             cv2.waitKey(1)
-            # 跳帧
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fid) # 跳帧
         return images
     
     # 清除临时文件
@@ -192,8 +221,8 @@ class VideoHandler(object):
     # 抽帧比对图片的余弦相似度
     @staticmethod
     def cal_cos_similarity(v1, v2) -> float:
-        v1_imgs = v1.frames
-        v2_imgs = v2.frames
+        v1_imgs = v1.get_frames()
+        v2_imgs = v2.get_frames()
         if len(v1_imgs) != len(v2_imgs) or len(v1_imgs) == 0 or len(v2_imgs) == 0:
             return 0.0
         avg_cosin = 0
@@ -209,11 +238,11 @@ class VideoHandler(object):
     # 判断两个视频是否相同
     @staticmethod
     def is_same(v1, v2, threshold=0.99):
-        if v1.cap is None or v2.cap is None:
-            print('视频加载失败')
+        v1_info = v1.get_video_info()
+        v2_info = v2.get_video_info()
+        if v1_info == {} or v2_info == {}:
+            print('[is_same] 视频信息为空')
             return False
-        v1_info = v1.video_info
-        v2_info = v2.video_info
         # 条件1: md5相同
         if v1_info["md5"] == v2_info["md5"]:
             return True
@@ -227,26 +256,6 @@ class VideoHandler(object):
         if cosin < threshold:
             return False
         return True
-
-
-def test_video_info():
-    v = VideoHandler('data/video/1.mp4')
-    info = v.get_video_info()
-    print(info)
-
-
-# 视频跳帧测试
-def test_video_skip_frame():
-    v = VideoHandler('data/video/fjdc.mp4')
-    info = v.get_video_info()
-    frame_ids = [i for i in range(1, info["frame_count"], 15)]
-    for fid in frame_ids:
-        rval, frame = v.cap.read()
-        if not rval:
-            break
-        cv2.imshow('frame', frame)
-        cv2.waitKey(1)
-        v.cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
 
 
 # ========================
@@ -289,25 +298,10 @@ class ImageHandler(object):
         return res
 
 
-def test_image_diff():
-    image1 = Image.open('data/img/1.jpeg')
-    image2 = Image.open('data/img/2.jpeg')
-    cosin = ImageHandler.image_similarity_vectors_via_numpy(image1, image2)
-    print('图片余弦相似度', cosin)
-
-
-# ========================
-# main
-# ========================
 def main():
-    v1 = VideoHandler('data/video/1.mp4')
-    v2 = VideoHandler('data/video/2.mp4')
-    res = VideoHandler.is_same(v1, v2)
-    if res:
-        print('视频相似')
-    else:
-        print('视频不相似')
-
+    v = VideoHandler('data/video/1.mp4', frame_ratio=0.01)
+    info = v.get_video_info()
+    print(info)
 
 if __name__ == '__main__':
-    test_delete_duplicate()
+    main()
